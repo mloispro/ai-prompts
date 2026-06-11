@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -67,6 +68,39 @@ def _setup_logging() -> logging.Logger:
 LOG = _setup_logging()
 
 SERVER_PID = os.getpid()
+
+
+def _load_dotenv_if_present(path: Path) -> None:
+    """Load KEY=VALUE pairs from a dotenv-style file.
+
+    Existing environment variables take precedence.
+    """
+
+    if not path.exists() or not path.is_file():
+        return
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            key = (k or "").strip()
+            if not key or key in os.environ:
+                continue
+            val = (v or "").strip()
+            if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+                val = val[1:-1]
+            os.environ[key] = val
+    except Exception as e:
+        LOG.info("dotenv.load_failed path=%s reason=%s", str(path), str(e))
+
+
+# Load local env files early so APIs (including /api/models discovery)
+# can use OPENAI_API_KEY without requiring shell-level exports.
+_load_dotenv_if_present(WEB_ROOT / ".env.local")
+_load_dotenv_if_present(WEB_ROOT / ".env")
 
 
 def _try_git_head_sha(cwd: Path) -> str:
@@ -661,29 +695,144 @@ _MODEL_CATALOG: List[ModelPricing] = [
     ),
 ]
 
+_OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
+_MODEL_DISCOVERY_TTL_SECONDS = 300
+_MODEL_ID_RE = re.compile(r"^gpt-(\d+)(?:\.(\d+))?(?:-(latest|codex|mini|nano))?$")
+_UNSTABLE_MODEL_MARKERS = ("preview", "canary", "beta", "alpha", "rc")
+_EXCLUDED_MODEL_MARKERS = (
+    "realtime",
+    "audio",
+    "transcribe",
+    "tts",
+    "embedding",
+    "whisper",
+    "omni",
+    "moderation",
+    "image",
+)
+_MODEL_DISCOVERY_CACHE: Dict[str, Any] = {
+    "expiresAt": 0.0,
+    "latestModel": "",
+}
+
+
+def _variant_rank(variant: str) -> int:
+    # Prefer general-purpose model IDs over specialized suffixes.
+    order = {"latest": 4, "": 3, "codex": 2, "mini": 1, "nano": 0}
+    return order.get((variant or "").lower(), -1)
+
+
+def _is_stable_chat_model_id(model_id: str) -> bool:
+    m = (model_id or "").strip().lower()
+    if not m.startswith("gpt-"):
+        return False
+    if any(marker in m for marker in _EXCLUDED_MODEL_MARKERS):
+        return False
+    if any(marker in m for marker in _UNSTABLE_MODEL_MARKERS):
+        return False
+    # Exclude dated snapshots like gpt-4.1-2025-04-14.
+    if re.search(r"-\d{4}-\d{2}-\d{2}$", m):
+        return False
+    return True
+
+
+def _latest_model_sort_key(model_id: str) -> tuple:
+    m = _MODEL_ID_RE.match((model_id or "").strip().lower())
+    if not m:
+        return (-1, -1, -1, model_id)
+    major = int(m.group(1) or 0)
+    minor = int(m.group(2) or 0)
+    variant = m.group(3) or ""
+    return (major, minor, _variant_rank(variant), model_id)
+
+
+def _fallback_pricing_for_model(model_id: str) -> ModelPricing:
+    m = (model_id or "").strip().lower()
+    by_name = {x.model: x for x in _MODEL_CATALOG}
+    if m.endswith("-nano") and "gpt-5-nano" in by_name:
+        base = by_name["gpt-5-nano"]
+    elif m.endswith("-mini") and "gpt-5-mini" in by_name:
+        base = by_name["gpt-5-mini"]
+    elif m.startswith("gpt-4.1") and "gpt-4.1" in by_name:
+        base = by_name["gpt-4.1"]
+    elif m.startswith("gpt-5") and "gpt-5.2" in by_name:
+        base = by_name["gpt-5.2"]
+    else:
+        base = _MODEL_CATALOG[0]
+    return ModelPricing(
+        model=model_id,
+        input_per_1m=base.input_per_1m,
+        cached_input_per_1m=base.cached_input_per_1m,
+        output_per_1m=base.output_per_1m,
+        is_latest=True,
+    )
+
+
+def _discover_latest_stable_model_from_api() -> str:
+    now = time.time()
+    if now < float(_MODEL_DISCOVERY_CACHE.get("expiresAt") or 0):
+        return str(_MODEL_DISCOVERY_CACHE.get("latestModel") or "")
+
+    latest = ""
+    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if api_key:
+        try:
+            req = urllib.request.Request(
+                _OPENAI_MODELS_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "User-Agent": "ai-prompts-workbench/1.0",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            data = payload.get("data") if isinstance(payload, dict) else None
+            ids: List[str] = []
+            if isinstance(data, list):
+                for row in data:
+                    if not isinstance(row, dict):
+                        continue
+                    model_id = (row.get("id") or "").strip()
+                    if _is_stable_chat_model_id(model_id):
+                        ids.append(model_id)
+            if ids:
+                latest = max(ids, key=_latest_model_sort_key)
+        except Exception as e:
+            LOG.info("models.discovery_failed reason=%s", str(e))
+
+    _MODEL_DISCOVERY_CACHE["latestModel"] = latest
+    _MODEL_DISCOVERY_CACHE["expiresAt"] = now + _MODEL_DISCOVERY_TTL_SECONDS
+    return latest
+
 
 def _pick_models_for_dropdown() -> List[ModelPricing]:
-    # Keep the dropdown intentionally small (4 options) and aligned to the
-    # recommended workflow:
-    # - default: gpt-5.2
-    # - cheapest/bulk: gpt-5-mini
-    # - cheapest/bulk: gpt-5-nano
-    # - additional option: gpt-5.1
-    preferred = ["gpt-5.2", "gpt-5-mini", "gpt-5-nano", "gpt-5.1"]
+    # Keep existing model options while auto-including the latest stable model
+    # when it can be discovered from the OpenAI models API.
+    latest_discovered = _discover_latest_stable_model_from_api()
+    base_preferred = ["gpt-5.2", "gpt-5-mini", "gpt-5-nano", "gpt-5.1"]
+    preferred: List[str] = []
+    if latest_discovered:
+        preferred.append(latest_discovered)
+    preferred.extend([m for m in base_preferred if m not in set(preferred)])
+
     by_name = {m.model: m for m in _MODEL_CATALOG}
+    if latest_discovered and latest_discovered not in by_name:
+        by_name[latest_discovered] = _fallback_pricing_for_model(latest_discovered)
+
     out: List[ModelPricing] = []
     for name in preferred:
         m = by_name.get(name)
         if m is not None:
             out.append(m)
-    # Fallback: if catalog changes, keep at least 4 entries.
-    if len(out) < 4:
+    # Fallback: if catalog changes, keep at least the preferred set.
+    target_count = len(preferred)
+    if len(out) < target_count:
         for m in _MODEL_CATALOG:
             if m.model not in {x.model for x in out}:
                 out.append(m)
-            if len(out) >= 4:
+            if len(out) >= target_count:
                 break
-    return out[:4]
+    return out[:target_count]
 
 
 def _pricing_by_model(model: str) -> Optional[ModelPricing]:
