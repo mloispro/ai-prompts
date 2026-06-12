@@ -697,9 +697,12 @@ _MODEL_CATALOG: List[ModelPricing] = [
 
 _OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 _MODEL_DISCOVERY_TTL_SECONDS = 300
-_MODEL_ID_RE = re.compile(r"^gpt-(\d+)(?:\.(\d+))?(?:-(latest|codex|mini|nano))?$")
+_DROPDOWN_MODEL_COUNT = 5
+_ALLOWED_MODEL_ID_RE = re.compile(r"^gpt-(\d+)(?:\.(\d+))?(?:-(mini))?$")
 _UNSTABLE_MODEL_MARKERS = ("preview", "canary", "beta", "alpha", "rc")
 _EXCLUDED_MODEL_MARKERS = (
+    "pro",
+    "codex",
     "realtime",
     "audio",
     "transcribe",
@@ -712,14 +715,8 @@ _EXCLUDED_MODEL_MARKERS = (
 )
 _MODEL_DISCOVERY_CACHE: Dict[str, Any] = {
     "expiresAt": 0.0,
-    "latestModel": "",
+    "latestModels": [],
 }
-
-
-def _variant_rank(variant: str) -> int:
-    # Prefer general-purpose model IDs over specialized suffixes.
-    order = {"latest": 4, "": 3, "codex": 2, "mini": 1, "nano": 0}
-    return order.get((variant or "").lower(), -1)
 
 
 def _is_stable_chat_model_id(model_id: str) -> bool:
@@ -736,14 +733,27 @@ def _is_stable_chat_model_id(model_id: str) -> bool:
     return True
 
 
+def _is_allowed_dropdown_model_id(model_id: str) -> bool:
+    # Include plain numbered IDs (gpt-5, gpt-5.2) and optional "-mini".
+    # This excludes pro/codex/date/suffixed variants.
+    m = (model_id or "").strip().lower()
+    return bool(_ALLOWED_MODEL_ID_RE.match(m))
+
+
+def _is_mini_model_id(model_id: str) -> bool:
+    return (model_id or "").strip().lower().endswith("-mini")
+
+
 def _latest_model_sort_key(model_id: str) -> tuple:
-    m = _MODEL_ID_RE.match((model_id or "").strip().lower())
+    m = _ALLOWED_MODEL_ID_RE.match((model_id or "").strip().lower())
     if not m:
         return (-1, -1, -1, model_id)
     major = int(m.group(1) or 0)
     minor = int(m.group(2) or 0)
-    variant = m.group(3) or ""
-    return (major, minor, _variant_rank(variant), model_id)
+    variant = (m.group(3) or "").lower()
+    # Prefer base over mini for same version number.
+    variant_rank = 1 if variant == "mini" else 2
+    return (major, minor, variant_rank, model_id)
 
 
 def _fallback_pricing_for_model(model_id: str) -> ModelPricing:
@@ -768,12 +778,15 @@ def _fallback_pricing_for_model(model_id: str) -> ModelPricing:
     )
 
 
-def _discover_latest_stable_model_from_api() -> str:
+def _discover_latest_stable_models_from_api() -> List[str]:
     now = time.time()
     if now < float(_MODEL_DISCOVERY_CACHE.get("expiresAt") or 0):
-        return str(_MODEL_DISCOVERY_CACHE.get("latestModel") or "")
+        cached = _MODEL_DISCOVERY_CACHE.get("latestModels")
+        if isinstance(cached, list):
+            return [str(x) for x in cached if isinstance(x, str)]
+        return []
 
-    latest = ""
+    latest: List[str] = []
     api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
     if api_key:
         try:
@@ -793,31 +806,53 @@ def _discover_latest_stable_model_from_api() -> str:
                     if not isinstance(row, dict):
                         continue
                     model_id = (row.get("id") or "").strip()
-                    if _is_stable_chat_model_id(model_id):
+                    if _is_stable_chat_model_id(model_id) and _is_allowed_dropdown_model_id(model_id):
                         ids.append(model_id)
             if ids:
-                latest = max(ids, key=_latest_model_sort_key)
+                deduped = sorted(set(ids), key=_latest_model_sort_key, reverse=True)
+                base_models = [m for m in deduped if not _is_mini_model_id(m)]
+                mini_models = [m for m in deduped if _is_mini_model_id(m)]
+
+                # Prefer latest base models, but include the latest mini when available.
+                picks: List[str] = []
+                picks.extend(base_models[: max(0, _DROPDOWN_MODEL_COUNT - 1)])
+                if mini_models:
+                    picks.append(mini_models[0])
+
+                # Backfill to the requested count with remaining base models first.
+                for m in base_models[max(0, _DROPDOWN_MODEL_COUNT - 1) :]:
+                    if m not in picks:
+                        picks.append(m)
+                    if len(picks) >= _DROPDOWN_MODEL_COUNT:
+                        break
+                for m in mini_models[1:]:
+                    if m not in picks:
+                        picks.append(m)
+                    if len(picks) >= _DROPDOWN_MODEL_COUNT:
+                        break
+
+                latest = picks[:_DROPDOWN_MODEL_COUNT]
         except Exception as e:
             LOG.info("models.discovery_failed reason=%s", str(e))
 
-    _MODEL_DISCOVERY_CACHE["latestModel"] = latest
+    _MODEL_DISCOVERY_CACHE["latestModels"] = latest
     _MODEL_DISCOVERY_CACHE["expiresAt"] = now + _MODEL_DISCOVERY_TTL_SECONDS
     return latest
 
 
 def _pick_models_for_dropdown() -> List[ModelPricing]:
-    # Keep existing model options while auto-including the latest stable model
-    # when it can be discovered from the OpenAI models API.
-    latest_discovered = _discover_latest_stable_model_from_api()
-    base_preferred = ["gpt-5.2", "gpt-5-mini", "gpt-5-nano", "gpt-5.1"]
-    preferred: List[str] = []
-    if latest_discovered:
-        preferred.append(latest_discovered)
-    preferred.extend([m for m in base_preferred if m not in set(preferred)])
+    # Include only the latest plain stable gpt models from API, excluding
+    # pro/codex/date/suffixed names.
+    preferred = _discover_latest_stable_models_from_api()
+
+    if not preferred:
+        fallback = [m.model for m in _MODEL_CATALOG if _is_allowed_dropdown_model_id(m.model)]
+        preferred = sorted(set(fallback), key=_latest_model_sort_key, reverse=True)[:_DROPDOWN_MODEL_COUNT]
 
     by_name = {m.model: m for m in _MODEL_CATALOG}
-    if latest_discovered and latest_discovered not in by_name:
-        by_name[latest_discovered] = _fallback_pricing_for_model(latest_discovered)
+    for name in preferred:
+        if name not in by_name:
+            by_name[name] = _fallback_pricing_for_model(name)
 
     out: List[ModelPricing] = []
     for name in preferred:
@@ -835,11 +870,20 @@ def _pick_models_for_dropdown() -> List[ModelPricing]:
     return out[:target_count]
 
 
+def _latest_ai_editor_model() -> str:
+    models = _pick_models_for_dropdown()
+    if models:
+        return models[0].model
+    return "gpt-5.2"
+
+
 def _pricing_by_model(model: str) -> Optional[ModelPricing]:
     model = (model or "").strip()
     for m in _MODEL_CATALOG:
         if m.model == model:
             return m
+    if _is_allowed_dropdown_model_id(model):
+        return _fallback_pricing_for_model(model)
     return None
 
 
@@ -1173,9 +1217,9 @@ def api_edit_propose(payload: Dict[str, Any], request: Request) -> JSONResponse:
     _ensure_state_dirs()
 
     app_id = (payload.get("appId") or "").strip() or _default_app_id()
-    # AI editor uses a fixed high-quality model. The UI dropdown is not authoritative.
+    # AI editor uses the latest discovered model. The UI dropdown is not authoritative.
     model_requested = (payload.get("model") or "").strip() or ""
-    model = "gpt-5.2"
+    model = _latest_ai_editor_model()
     target_key = (payload.get("targetKey") or "").strip()
     change_request = (payload.get("changeRequest") or "").strip()
     dry_run = bool(payload.get("dryRun") or False)

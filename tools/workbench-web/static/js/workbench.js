@@ -47,8 +47,11 @@ const HUE_STYLES = [
   { background: '#f0fdf4', color: '#166534', borderColor: '#bbf7d0' },  // 8 green (base)
 ];
 
-// AI editor uses a fixed high-quality model (independent of the dropdown).
-const AI_EDITOR_MODEL = 'gpt-5.2';
+// AI editor uses the latest discovered model from /api/models.
+function aiEditorModel() {
+  if (Array.isArray(models) && models.length && models[0]?.model) return models[0].model;
+  return 'gpt-5.2';
+}
 
 // ── API helper ────────────────────────────────────────────────────────
 async function api(path, opts) {
@@ -296,7 +299,8 @@ function openAiModal() {
   }
 
   // Show the AI editor model even before the first run.
-  renderAiCallMeta({ modelRequested: AI_EDITOR_MODEL, modelUsed: AI_EDITOR_MODEL, usage: null, cost: null, dryRun: !!document.getElementById('dryRun')?.checked });
+  const model = aiEditorModel();
+  renderAiCallMeta({ modelRequested: model, modelUsed: model, usage: null, cost: null, dryRun: !!document.getElementById('dryRun')?.checked });
 
   const modal = document.getElementById('aiModal');
   if (!modal) return;
@@ -1027,7 +1031,7 @@ async function aiPropose() {
   const status = document.getElementById('aiEditStatus');
 
   const appId = document.getElementById('appSelect').value;
-  const model = AI_EDITOR_MODEL;
+  const model = aiEditorModel();
   const dryRun = !!document.getElementById('dryRun').checked;
   const mode = document.getElementById('modeSelect').value;
   const targetKey = MODE_TO_PROMPT_KEY[mode] || 'openerSystem';
@@ -1096,6 +1100,14 @@ async function aiPropose() {
     }
 
     status.textContent = ok ? 'Ready to apply' : 'Cannot apply';
+  } catch (e) {
+    const msg = (e && e.message) ? e.message : String(e);
+    document.getElementById('aiError').textContent = msg;
+    status.textContent = 'Error';
+    document.getElementById('aiApplyBtn').disabled = true;
+    // Do not leave the indefinite thinking placeholder visible after failure.
+    diffEl.innerHTML = '<div class="muted">Request failed. Fix the issue and try again.</div>';
+    hideSysDiffOverlay();
   } finally {
     proposeBtn.classList.remove('loading');
     // W5: re-enable propose only when input has text
@@ -1122,7 +1134,7 @@ async function aiApply() {
 
   const appId = document.getElementById('appSelect').value;
   const mode = document.getElementById('modeSelect').value;
-  const model = AI_EDITOR_MODEL;
+  const model = aiEditorModel();
   const payload = {
     appId, mode, model,
     changeRequest: (document.getElementById('aiChangeRequest').value || '').trim(),
